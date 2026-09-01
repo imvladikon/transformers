@@ -118,9 +118,32 @@ def resolve_internal_import(module: ModuleType | None, chained_path: str) -> Cal
     for path in chained_path.split("."):
         final_module = getattr(final_module, path, None)
         if not final_module:
-            return None
+            final_module = None
+            break
 
-    return final_module
+    if final_module is not None:
+        return final_module
+
+    # Submodules are not bound as attributes of their parent package until they are imported,
+    # and some libraries (e.g. `fla`) expose them lazily. In that case the getattr walk above
+    # fails even though the import itself is perfectly valid, and the caller silently falls
+    # back to a slower path. Import the longest importable prefix first, then resolve the rest.
+    parts = chained_path.split(".")
+    for split in range(len(parts) - 1, 0, -1):
+        try:
+            submodule = importlib.import_module(f"{module.__name__}." + ".".join(parts[:split]))
+        except Exception:
+            continue
+
+        resolved = submodule
+        for path in parts[split:]:
+            resolved = getattr(resolved, path, None)
+            if not resolved:
+                break
+        if resolved is not None:
+            return resolved
+
+    return None
 
 
 def is_env_variable_true(env_variable: str) -> bool:
