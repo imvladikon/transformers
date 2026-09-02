@@ -939,22 +939,24 @@ class Fp8Quantize(ConversionOps):
         return tuple(block_size)
 
     def _quantize_one(self, key: str, value: torch.Tensor) -> dict[str, torch.Tensor]:
-        # Pass through tensors that aren't tileable (1D norms / biases, or shapes
-        # that don't divide cleanly by the configured block) — they were never
-        # FP8-quantized on the load side, so the reverse op shouldn't touch them.
+        # Norms and biases are not block-quantized. Linear weights may have a
+        # partial final block, as in GLM's 576-wide MLA projection with 128x128
+        # blocks, so pad only for the block reduction and crop the payload back.
         if value.ndim < 2:
             return {key: value}
         block_m, block_n = self._resolve_block_size(value)
         rows, cols = value.shape[-2], value.shape[-1]
-        if rows % block_m != 0 or cols % block_n != 0:
-            return {key: value}
 
         # Leading dims can be empty (2D) or include num_experts/... (3D+)
         leading_shape = value.shape[:-2]
-        rows_tiles = rows // block_m
-        cols_tiles = cols // block_n
+        rows_tiles = (rows + block_m - 1) // block_m
+        cols_tiles = (cols + block_n - 1) // block_n
         original_shape = value.shape
         value_fp32 = value.to(torch.float32)
+        padded_rows = rows_tiles * block_m
+        padded_cols = cols_tiles * block_n
+        if padded_rows != rows or padded_cols != cols:
+            value_fp32 = F.pad(value_fp32, (0, padded_cols - cols, 0, padded_rows - rows))
         # Reshape to (..., rows_tiles, block_m, cols_tiles, block_n)
         reshaped = value_fp32.reshape(*leading_shape, rows_tiles, block_m, cols_tiles, block_n)
         # Per-tile max-abs over the block dims (block_m at -3, block_n at -1)
@@ -974,6 +976,7 @@ class Fp8Quantize(ConversionOps):
         scales_broadcast = scales.unsqueeze(-1).unsqueeze(-3)  # (..., rows_tiles, 1, cols_tiles, 1)
         scaled = reshaped * scales_broadcast
         quantized = torch.clamp(scaled, min=_FP8_MIN, max=_FP8_MAX).to(_FP8_DTYPE)
+        quantized = quantized.reshape(*leading_shape, padded_rows, padded_cols)[..., :rows, :cols]
         quantized = quantized.reshape(original_shape)
         scale_key = key.rsplit(".", 1)[0] + ".weight_scale_inv" if key.endswith(".weight") else key + "_scale_inv"
         return {key: quantized, scale_key: inv_scales}
@@ -1046,7 +1049,8 @@ class Fp8Dequantize(ConversionOps):
         # FP4 path: int8 / float4_e2m1fn_x2 stores two nibbles per byte. Unpack to fp32
         # first so the rest of the routine sees a normal (rows, cols) float matrix.
         fp4_dtype = getattr(torch, "float4_e2m1fn_x2", None)
-        if quantized.dtype == torch.int8 or (fp4_dtype is not None and quantized.dtype == fp4_dtype):
+        is_fp4 = quantized.dtype == torch.int8 or (fp4_dtype is not None and quantized.dtype == fp4_dtype)
+        if is_fp4:
             quantized_fp32 = self._unpack_fp4(quantized)
         else:
             quantized_fp32 = quantized.to(torch.float32)
@@ -1059,12 +1063,34 @@ class Fp8Dequantize(ConversionOps):
         except Exception:
             # scale can be a single tensor in extreme cases where it was not wrapped properly but is [1,0].
             scale_rows, scale_cols = 1, 1
-        if rows % scale_rows or cols % scale_cols:
-            raise ValueError(
-                f"Weight shape ({rows}, {cols}) not divisible by scale grid ({scale_rows}, {scale_cols})."
+        quantization_config = self.hf_quantizer.quantization_config
+        if isinstance(quantization_config, dict):
+            configured_block_size = quantization_config.get("weight_block_size")
+        else:
+            configured_block_size = getattr(quantization_config, "weight_block_size", None)
+        if not is_fp4 and configured_block_size is not None:
+            block_m, block_n = configured_block_size
+            expected_scale_shape = (
+                (rows + block_m - 1) // block_m,
+                (cols + block_n - 1) // block_n,
             )
-        block_m = rows // scale_rows
-        block_n = cols // scale_cols
+            if (scale_rows, scale_cols) != expected_scale_shape:
+                raise ValueError(
+                    f"Scale grid ({scale_rows}, {scale_cols}) does not match weight shape "
+                    f"({rows}, {cols}) with block size ({block_m}, {block_n}); expected "
+                    f"{expected_scale_shape}."
+                )
+            has_partial_block = bool(rows % block_m or cols % block_n)
+        else:
+            # FP4 experts can use a different scale granularity from dense FP8
+            # weights in the same checkpoint, so preserve scale-grid inference.
+            if rows % scale_rows or cols % scale_cols:
+                raise ValueError(
+                    f"Weight shape ({rows}, {cols}) not divisible by scale grid ({scale_rows}, {scale_cols})."
+                )
+            block_m = rows // scale_rows
+            block_n = cols // scale_cols
+            has_partial_block = False
         # ``ue8m0`` (``float8_e8m0fnu``) scales have no CUDA ``mul`` kernel, and casting
         # the FP8 weight to that dtype loses precision. Promote both sides to fp32 for
         # the math; prefer the destination parameter's dtype when known so eager modules
@@ -1081,9 +1107,23 @@ class Fp8Dequantize(ConversionOps):
         else:
             s_fp32 = scales.to(torch.float32)
         original_shape = quantized_fp32.shape
-        q = quantized_fp32.reshape(-1, scale_rows, block_m, scale_cols, block_n)
-        s = s_fp32.reshape(-1, scale_rows, scale_cols).unsqueeze(-1).unsqueeze(2)
-        return (q * s).to(output_dtype).reshape(original_shape)
+        if not has_partial_block:
+            q = quantized_fp32.reshape(-1, scale_rows, block_m, scale_cols, block_n)
+            s = s_fp32.reshape(-1, scale_rows, scale_cols).unsqueeze(-1).unsqueeze(2)
+            return (q * s).to(output_dtype).reshape(original_shape)
+
+        # Avoid materializing a full weight-sized expanded scale tensor. Only a
+        # one-row-block scale vector is expanded at a time, including the short
+        # final block, and the output allocation is the same size as the weight.
+        output = torch.empty_like(quantized_fp32, dtype=output_dtype)
+        for row_block in range(scale_rows):
+            row_start = row_block * block_m
+            row_stop = min(row_start + block_m, rows)
+            column_scales = s_fp32[..., row_block, :].repeat_interleave(block_n, dim=-1)[..., :cols]
+            output[..., row_start:row_stop, :] = (
+                quantized_fp32[..., row_start:row_stop, :] * column_scales.unsqueeze(-2)
+            ).to(output_dtype)
+        return output
 
     def _get_target_dtype(self, model: torch.nn.Module | None, full_layer_name: str | None) -> torch.dtype | None:
         if model is None or full_layer_name is None:

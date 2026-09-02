@@ -681,6 +681,49 @@ class TestConvertAndLoadStateDict(unittest.TestCase):
                 torch.equal(out["layer.weight_scale_inv"], ref_inv), f"float scale diverged at seed {seed}"
             )
 
+    def test_fp8_partial_edge_block_round_trip(self):
+        from transformers.integrations.finegrained_fp8 import Fp8Dequantize, Fp8Quantize
+
+        block_size = (4, 4)
+        quantizer = SimpleNamespace(
+            quantization_config=SimpleNamespace(weight_block_size=block_size, scale_fmt="float")
+        )
+        torch.manual_seed(0)
+        weight = torch.randn(6, 10, dtype=torch.float32)
+
+        quantized = Fp8Quantize(quantizer)._quantize_one("layer.weight", weight)
+        self.assertEqual(quantized["layer.weight"].shape, weight.shape)
+        self.assertEqual(quantized["layer.weight_scale_inv"].shape, (2, 3))
+
+        recovered = Fp8Dequantize(quantizer)._dequantize_one(
+            quantized["layer.weight"],
+            quantized["layer.weight_scale_inv"],
+            output_dtype=torch.float32,
+        )
+        self.assertEqual(recovered.shape, weight.shape)
+        rel_err = ((recovered - weight).abs().sum() / weight.abs().sum()).item()
+        self.assertLess(rel_err, 5e-2)
+
+        # The weight dimensions can both be divisible by the number of scale
+        # blocks while still ending in partial configured blocks (6 / 2 != 4).
+        square_weight = torch.randn(6, 6, dtype=torch.float32)
+        square_quantized = Fp8Quantize(quantizer)._quantize_one("square.weight", square_weight)
+        self.assertEqual(square_quantized["square.weight_scale_inv"].shape, (2, 2))
+        square_recovered = Fp8Dequantize(quantizer)._dequantize_one(
+            square_quantized["square.weight"],
+            square_quantized["square.weight_scale_inv"],
+            output_dtype=torch.float32,
+        )
+        square_rel_err = ((square_recovered - square_weight).abs().sum() / square_weight.abs().sum()).item()
+        self.assertLess(square_rel_err, 5e-2)
+
+        with self.assertRaisesRegex(ValueError, "does not match weight shape"):
+            Fp8Dequantize(quantizer)._dequantize_one(
+                quantized["layer.weight"],
+                quantized["layer.weight_scale_inv"][:1],
+                output_dtype=torch.float32,
+            )
+
     def test_scoped_renaming_does_not_leak_to_sibling_or_parent(self):
         """scope_prefix gates a WeightRenaming to keys under one submodel only —
         neither the sibling submodel nor the parent's own keys must be affected.
